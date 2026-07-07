@@ -103,6 +103,17 @@ class RequestConnector(Connector, Thread):
             request_sent = False
             if self.__requests_in_progress:
                 for req in self.__requests_in_progress:
+                    if req["config"].get("streamType") == "sse":
+                        thread = req.get("stream_thread")
+                        if thread is None or not thread.is_alive():
+                            thread = Thread(target=self.__stream_sse_request, args=(req, self._log),
+                                            daemon=True,
+                                            name="SSE request to endpoint '%s' Thread" % req["config"].get("url"))
+                            req["stream_thread"] = thread
+                            thread.start()
+                            request_sent = True
+                        continue
+
                     if time() >= req["next_time"]:
                         thread = Thread(target=self.__send_request, args=(req, self.__convert_queue, self._log),
                                         daemon=True,
@@ -418,13 +429,7 @@ class RequestConnector(Connector, Thread):
             if request.get("converter") is None and isinstance(request["config"].get("converter"), dict):
                 logger.error("Converter for request to '%s' endpoint is not defined. Request will be skipped.", request["config"].get("url"))
                 return
-            request_url_from_config = request["config"]["url"]
-            request_url_from_config = (
-                str("/" + request_url_from_config)
-                if not request_url_from_config.startswith("/")
-                   and not request_url_from_config.startswith("http")
-                else request_url_from_config
-            )
+            request_url_from_config = self.__prepare_request_url(request["config"]["url"])
             logger.debug("Obtained request url from config - %s ", request_url_from_config)
             url, response = self.__execute_request(request, request_url_from_config, logger)
 
@@ -469,9 +474,108 @@ class RequestConnector(Connector, Thread):
         except Exception as e:
             logger.exception(e)
 
-    def __execute_request(self, request, request_url, logger):
-        url = self.__host + request_url if not request_url.lower().startswith("http") else request_url
+    def __stream_sse_request(self, request, logger):
+        reconnect_period = request["config"].get("reconnectPeriod", 5)
+        url = ""
 
+        while not self.__stopped:
+            try:
+                if request.get("converter") is None and isinstance(request["config"].get("converter"), dict):
+                    logger.error("Converter for request to '%s' endpoint is not defined. SSE stream will be skipped.",
+                                 request["config"].get("url"))
+                    return
+
+                request_url_from_config = self.__prepare_request_url(request["config"]["url"])
+                url = self.__build_url(request_url_from_config)
+                params = self.__build_request_params(request, url)
+                if "timeout" not in request["config"]:
+                    params["timeout"] = (5, 60)
+                params["stream"] = True
+                params.setdefault("headers", {})
+                params["headers"].setdefault("Accept", "text/event-stream")
+
+                logger.info("Opening SSE stream to %s", url)
+                with request["request"](**params) as response:
+                    if not response.ok:
+                        logger.error("SSE request to URL: %s finished with code: %i", url, response.status_code)
+                        sleep(reconnect_period)
+                        continue
+
+                    self.__process_sse_response(response, url, request, logger)
+
+            except Timeout:
+                logger.warning("SSE timeout on request %s. Reconnecting in %s seconds.", url, reconnect_period)
+            except RequestException as e:
+                logger.warning("Cannot connect to SSE stream %s. Reconnecting in %s seconds.", url, reconnect_period)
+                logger.debug(e)
+            except ConnectionError:
+                logger.warning("Cannot connect to SSE stream %s. Reconnecting in %s seconds.", url, reconnect_period)
+            except Exception as e:
+                logger.exception(e)
+
+            if not self.__stopped:
+                sleep(reconnect_period)
+
+    def __process_sse_response(self, response, url, request, logger):
+        event_name = None
+        data_lines = []
+
+        for line in response.iter_lines(decode_unicode=True):
+            if self.__stopped:
+                return
+
+            if isinstance(line, bytes):
+                line = line.decode(response.encoding or "utf-8", errors="replace")
+
+            if line == "":
+                if data_lines:
+                    self.__convert_sse_event(url, request, event_name, data_lines, logger)
+                event_name = None
+                data_lines = []
+                continue
+
+            if line.startswith(":"):
+                continue
+
+            if line.startswith("event:"):
+                event_name = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[len("data:"):].strip())
+
+        if data_lines and not self.__stopped:
+            self.__convert_sse_event(url, request, event_name, data_lines, logger)
+
+    def __convert_sse_event(self, url, request, event_name, data_lines, logger):
+        raw_data = "\n".join(data_lines)
+        try:
+            payload = loads(raw_data)
+        except Exception:
+            payload = {"value": raw_data}
+
+        if isinstance(payload, dict) and event_name:
+            payload.setdefault("event", event_name)
+
+        if not self.__convert_queue.full():
+            logger.debug("Converting SSE event from %s: %s", url, payload)
+            self.__convert_data([url, request["converter"], payload])
+
+    def __execute_request(self, request, request_url, logger):
+        url = self.__build_url(request_url)
+
+        params = self.__build_request_params(request, url)
+        logger.debug("Full url request has been formed - %s", url)
+        logger.debug("Request to %s will be sent", url)
+        if isinstance(params["data"], str):
+            params["data"] = params["data"].encode("utf-8")
+        self._log.debug("Sending request to URL: %s with params %s", url, params)
+        response = request["request"](**params)
+
+        return url, response
+
+    def __build_url(self, request_url):
+        return self.__host + request_url if not request_url.lower().startswith("http") else request_url
+
+    def __build_request_params(self, request, url):
         request_timeout = request["config"].get("timeout", 1)
         params = {
             "method": request["config"].get("httpMethod", "GET"),
@@ -482,18 +586,20 @@ class RequestConnector(Connector, Thread):
             "auth": self.__security,
             "data": request["config"].get("data", {})
         }
-        logger.debug("Full url request has been formed - %s", url)
 
         if request["config"].get("httpHeaders") is not None:
-            params["headers"] = request["config"]["httpHeaders"]
+            params["headers"] = dict(request["config"]["httpHeaders"])
 
-        logger.debug("Request to %s will be sent", url)
-        if isinstance(params["data"], str):
-            params["data"] = params["data"].encode("utf-8")
-        self._log.debug("Sending request to URL: %s with params %s", url, params)
-        response = request["request"](**params)
+        return params
 
-        return url, response
+    @staticmethod
+    def __prepare_request_url(request_url):
+        return (
+            str("/" + request_url)
+            if not request_url.startswith("/")
+               and not request_url.startswith("http")
+            else request_url
+        )
 
     def __convert_data(self, data):
         try:
