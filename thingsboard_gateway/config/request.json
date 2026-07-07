@@ -47,6 +47,35 @@
       }
     },
     {
+      "url": "/events",
+      "httpMethod": "GET",
+      "streamType": "sse",
+      "reconnectPeriod": 5,
+      "httpHeaders": {
+        "Accept": "text/event-stream"
+      },
+      "allowRedirects": true,
+      "dataUnpackExpression": "",
+      "converter": {
+        "type": "json",
+        "deviceNameJsonExpression": "SSE Device",
+        "deviceTypeJsonExpression": "SSE",
+        "attributes": [],
+        "telemetry": [
+          {
+            "key": "event",
+            "type": "string",
+            "value": "${event}"
+          },
+          {
+            "key": "value",
+            "type": "string",
+            "value": "${value}"
+          }
+        ]
+      }
+    },
+    {
       "url": "get_info",
       "httpMethod": "GET",
       "httpHeaders": {
