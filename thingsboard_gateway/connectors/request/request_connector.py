@@ -475,10 +475,10 @@ class RequestConnector(Connector, Thread):
             logger.exception(e)
 
     def __stream_sse_request(self, request, logger):
-        reconnect_period = request["config"].get("reconnectPeriod", 5)
         url = ""
 
         while not self.__stopped:
+            reconnect_period = request.get("sse_reconnect_period", request["config"].get("reconnectPeriod", 5))
             try:
                 if request.get("converter") is None and isinstance(request["config"].get("converter"), dict):
                     logger.error("Converter for request to '%s' endpoint is not defined. SSE stream will be skipped.",
@@ -493,15 +493,27 @@ class RequestConnector(Connector, Thread):
                 params["stream"] = True
                 params.setdefault("headers", {})
                 params["headers"].setdefault("Accept", "text/event-stream")
+                if request.get("last_event_id"):
+                    params["headers"]["Last-Event-ID"] = request["last_event_id"]
 
                 logger.info("Opening SSE stream to %s", url)
                 with request["request"](**params) as response:
+                    if response.status_code == 204:
+                        logger.info("SSE stream to %s returned 204 No Content. Stream will not reconnect.", url)
+                        return
                     if not response.ok:
                         logger.error("SSE request to URL: %s finished with code: %i", url, response.status_code)
-                        sleep(reconnect_period)
-                        continue
+                        return
+                    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                    if content_type != "text/event-stream":
+                        logger.error("SSE request to URL: %s returned unsupported Content-Type: %s", url,
+                                     response.headers.get("Content-Type"))
+                        return
 
-                    self.__process_sse_response(response, url, request, logger)
+                    should_reconnect = self.__process_sse_response(response, url, request, logger)
+                    if not should_reconnect:
+                        logger.info("SSE stream to %s was stopped.", url)
+                        return
 
             except Timeout:
                 logger.warning("SSE timeout on request %s. Reconnecting in %s seconds.", url, reconnect_period)
@@ -518,16 +530,18 @@ class RequestConnector(Connector, Thread):
 
     def __process_sse_response(self, response, url, request, logger):
         event_name = None
+        last_event_id = request.get("last_event_id", "")
         data_lines = []
 
         for line in response.iter_lines(decode_unicode=True):
             if self.__stopped:
-                return
+                return False
 
             if isinstance(line, bytes):
                 line = line.decode(response.encoding or "utf-8", errors="replace")
 
             if line == "":
+                request["last_event_id"] = last_event_id
                 if data_lines:
                     self.__convert_sse_event(url, request, event_name, data_lines, logger)
                 event_name = None
@@ -537,13 +551,24 @@ class RequestConnector(Connector, Thread):
             if line.startswith(":"):
                 continue
 
-            if line.startswith("event:"):
-                event_name = line[len("event:"):].strip()
-            elif line.startswith("data:"):
-                data_lines.append(line[len("data:"):].strip())
+            if ":" in line:
+                field, value = line.split(":", 1)
+                if value.startswith(" "):
+                    value = value[1:]
+            else:
+                field = line
+                value = ""
 
-        if data_lines and not self.__stopped:
-            self.__convert_sse_event(url, request, event_name, data_lines, logger)
+            if field == "event":
+                event_name = value
+            elif field == "data":
+                data_lines.append(value)
+            elif field == "id" and "\0" not in value:
+                last_event_id = value
+            elif field == "retry" and value.isdigit():
+                request["sse_reconnect_period"] = int(value) / 1000
+
+        return not self.__stopped
 
     def __convert_sse_event(self, url, request, event_name, data_lines, logger):
         raw_data = "\n".join(data_lines)
@@ -552,8 +577,8 @@ class RequestConnector(Connector, Thread):
         except Exception:
             payload = {"value": raw_data}
 
-        if isinstance(payload, dict) and event_name:
-            payload.setdefault("event", event_name)
+        if isinstance(payload, dict):
+            payload.setdefault("event", event_name or "message")
 
         if not self.__convert_queue.full():
             logger.debug("Converting SSE event from %s: %s", url, payload)
