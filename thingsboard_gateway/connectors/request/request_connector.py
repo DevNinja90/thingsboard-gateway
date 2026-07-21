@@ -498,9 +498,6 @@ class RequestConnector(Connector, Thread):
 
                 logger.info("Opening SSE stream to %s", url)
                 with request["request"](**params) as response:
-                    if response.status_code == 204:
-                        logger.info("SSE stream to %s returned 204 No Content. Stream will not reconnect.", url)
-                        return
                     if not response.ok:
                         logger.error("SSE request to URL: %s finished with code: %i", url, response.status_code)
                         return
@@ -568,7 +565,7 @@ class RequestConnector(Connector, Thread):
             elif field == "retry" and value.isdigit():
                 request["sse_reconnect_period"] = int(value) / 1000
 
-        return not self.__stopped
+        return False
 
     def __convert_sse_event(self, url, request, event_name, data_lines, logger):
         raw_data = "\n".join(data_lines)

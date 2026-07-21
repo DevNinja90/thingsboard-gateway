@@ -45,7 +45,7 @@ set -e
 # ─── Configurable Defaults ────────────────────────────────────────────────
 DOCKERFILE_PATH="docker/Dockerfile"
 CONTEXT="."
-TAG="latest"
+TAG="0.2.2"
 DEFAULT_IMAGE="tb-gateway"
 BUILDER_NAME="multiarch-builder"
 

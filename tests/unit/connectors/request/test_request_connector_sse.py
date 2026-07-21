@@ -72,7 +72,7 @@ class RequestConnectorSseTest(TestCase):
 
         self.assertEqual({"bytes": 128, "event": "upload-progress"}, self.captured[0][2])
 
-    def test_server_closed_stream_reconnects_and_discards_incomplete_event(self):
+    def test_server_closed_stream_stops_without_reconnect(self):
         response = _SseResponse(
             [
                 "event: job-changed",
@@ -87,7 +87,7 @@ class RequestConnectorSseTest(TestCase):
             self.connector, response, "http://example/events", self.request, self.logger
         )
 
-        self.assertTrue(should_reconnect)
+        self.assertFalse(should_reconnect)
         self.assertEqual(1, len(self.captured))
         self.assertEqual({"job_id": "abc", "event": "job-changed"}, self.captured[0][2])
 
