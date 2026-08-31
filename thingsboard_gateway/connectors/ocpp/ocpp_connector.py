@@ -295,7 +295,7 @@ class OcppConnector(Connector, Thread):
                         data = attribute_update_config["valueExpression"] \
                             .replace("${attributeKey}", str(attr_key)) \
                             .replace("${attributeValue}", str(attr_value))
-                        request = call.DataTransferPayload('1', data=data)
+                        request = call.DataTransfer('1', data=data)
 
                         task = self.__loop.create_task(self._send_request(charge_point, request))
                         while not task.done():
@@ -337,7 +337,7 @@ class OcppConnector(Connector, Thread):
         for (tag, value) in zip(data_to_send_tags, data_to_send_values):
             data_to_send = data_to_send.replace('${' + tag + '}', dumps(value))
 
-        request = call.DataTransferPayload('1', data=data_to_send)
+        request = call.DataTransfer('1', data=data_to_send)
 
         task = self.__loop.create_task(
             self._send_request(charge_point, request))

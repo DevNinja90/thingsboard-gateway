@@ -45,6 +45,12 @@ if installation_required:
 from puresnmp import Client, credentials, PyWrapper
 from puresnmp.exc import Timeout as SNMPTimeoutException
 
+DEFAULT_SNMP_VERSION = 'v2c'
+SNMP_CREDENTIALS_BY_VERSION = {
+    'v1': credentials.V1,
+    'v2c': credentials.V2C,
+}
+
 
 class SNMPConnector(Connector, Thread):
     def __init__(self, gateway, config, connector_type):
@@ -170,7 +176,7 @@ class SNMPConnector(Connector, Thread):
     async def __process_methods(self, method, common_parameters, datatype_config):
         client = Client(ip=common_parameters['ip'],
                         port=common_parameters['port'],
-                        credentials=credentials.V1(common_parameters['community']))
+                        credentials=self.__get_credentials(common_parameters))
         client.configure(timeout=common_parameters['timeout'])
         client = PyWrapper(client)
 
@@ -247,12 +253,22 @@ class SNMPConnector(Connector, Thread):
         except Exception as e:
             self._log.exception(e)
 
+    def __get_credentials(self, common_parameters):
+        version = common_parameters.get("version", DEFAULT_SNMP_VERSION)
+        credentials_type = SNMP_CREDENTIALS_BY_VERSION.get(version)
+        if credentials_type is None:
+            self._log.warning("Unknown SNMP version: %r, falling back to %r. Supported versions: %s",
+                              version, DEFAULT_SNMP_VERSION, ", ".join(SNMP_CREDENTIALS_BY_VERSION))
+            credentials_type = SNMP_CREDENTIALS_BY_VERSION[DEFAULT_SNMP_VERSION]
+        return credentials_type(common_parameters["community"])
+
     @staticmethod
     def __get_common_parameters(device):
         return {"ip": gethostbyname(device["ip"]),
                 "port": device.get("port", 161),
                 "timeout": device.get("timeout", 6),
                 "community": device["community"],
+                "version": str(device.get("version", DEFAULT_SNMP_VERSION)).lower(),
                 }
 
     def on_attributes_update(self, content):

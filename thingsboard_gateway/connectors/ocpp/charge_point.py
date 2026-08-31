@@ -61,7 +61,7 @@ class ChargePoint(CP):
         self._stopped = True
         return await self._connection.close()
 
-    @on(Action.BootNotification)
+    @on(Action.boot_notification)
     def on_boot_notification(self, charge_point_vendor: str, charge_point_model: str, **kwargs):
         self._profile = {
             'Vendor': charge_point_vendor,
@@ -71,37 +71,37 @@ class ChargePoint(CP):
         self.type = self._uplink_converter.get_device_type(self._profile)
 
         self._callback((self._uplink_converter,
-                        {'deviceName': self.name, 'deviceType': self.type, 'messageType': Action.MeterValues,
+                        {'deviceName': self.name, 'deviceType': self.type, 'messageType': Action.meter_values,
                          'profile': self._profile},
                         {'Vendor': charge_point_vendor, 'Model': charge_point_model, **kwargs}))
 
-        return call_result.BootNotificationPayload(
+        return call_result.BootNotification(
             current_time=datetime.utcnow().isoformat(),
             interval=10,
             status=RegistrationStatus.accepted
         )
 
-    @on(Action.Authorize)
+    @on(Action.authorize)
     def on_authorize(self, id_tag: str, **kwargs):
         if self.authorized:
-            return call_result.AuthorizePayload(id_tag_info={'status': 'Accepted'})
+            return call_result.Authorize(id_tag_info={'status': 'Accepted'})
 
-        return call_result.AuthorizePayload(id_tag_info={'status': 'Not authorized'})
+        return call_result.Authorize(id_tag_info={'status': 'Not authorized'})
 
-    @on(Action.Heartbeat)
+    @on(Action.heartbeat)
     def on_heartbeat(self):
-        return call_result.HeartbeatPayload(
+        return call_result.Heartbeat(
             current_time=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S') + "Z"
         )
 
-    @on(Action.MeterValues)
+    @on(Action.meter_values)
     def on_meter_values(self, **kwargs):
         self._callback((self._uplink_converter,
-                        {'deviceName': self.name, 'deviceType': self.type, 'messageType': Action.MeterValues,
+                        {'deviceName': self.name, 'deviceType': self.type, 'messageType': Action.meter_values,
                          'profile': self._profile}, kwargs))
-        return call_result.MeterValuesPayload()
+        return call_result.MeterValues()
 
-    @on(Action.DataTransfer)
+    @on(Action.data_transfer)
     def on_data_transfer(self, **kwargs):
         for (key, value) in kwargs.items():
             try:
@@ -110,6 +110,6 @@ class ChargePoint(CP):
                 continue
 
         self._callback((self._uplink_converter,
-                        {'deviceName': self.name, 'deviceType': self.type, 'messageType': Action.DataTransfer,
+                        {'deviceName': self.name, 'deviceType': self.type, 'messageType': Action.data_transfer,
                          'profile': self._profile}, kwargs))
-        return call_result.DataTransferPayload(status=DataTransferStatus.accepted)
+        return call_result.DataTransfer(status=DataTransferStatus.accepted)
