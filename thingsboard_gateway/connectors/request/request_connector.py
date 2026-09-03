@@ -16,9 +16,10 @@ from queue import Queue
 from random import choice
 from re import fullmatch
 from string import ascii_lowercase
-from threading import Thread
+from threading import Event, Thread
 from time import sleep, time
 from os import environ
+from uuid import uuid4
 
 from simplejson import loads
 from thingsboard_gateway.gateway.entities.converted_data import ConvertedData
@@ -77,6 +78,7 @@ class RequestConnector(Connector, Thread):
         self.__connected = False
         self.__stopped = False
         self.__requests_in_progress = []
+        self.__active_sse_streams = {}
         self.__convert_queue = Queue(1000000)
         self.__attribute_updates = []
         self.__fill_attribute_updates()
@@ -218,6 +220,17 @@ class RequestConnector(Connector, Thread):
         results = []
         connector_rpc_params = content["data"].get("params")
 
+        rpc_method_name = None
+        try:
+            _, rpc_method_name = content["data"]["method"].split("_")
+        except (ValueError, AttributeError, KeyError):
+            pass
+
+        if rpc_method_name is not None and rpc_method_name.lower() == "startsse":
+            return [self.__start_sse_stream_rpc(connector_rpc_params)]
+        if rpc_method_name is not None and rpc_method_name.lower() == "stopsse":
+            return [self.__stop_sse_stream_rpc(connector_rpc_params)]
+
         try:
             rpc_request = self.__format_rpc_reqeust(params=connector_rpc_params)
             rpc_request["converter"] = JsonRequestDownlinkConverter(
@@ -232,6 +245,91 @@ class RequestConnector(Connector, Thread):
         result = self.__prepare_and_execute_rpc(rpc_request, content)
         results.append(self.__result_to_dict(result))
         return results
+
+    def __start_sse_stream_rpc(self, params: dict) -> dict:
+        params = params or {}
+        url = params.get("url")
+        if not url:
+            return {"success": False, "error": "url parameter is required to start an SSE stream"}
+
+        stream_id = str(params.get("streamId") or uuid4())
+        if stream_id in self.__active_sse_streams:
+            return {"success": False, "error": f"SSE stream '{stream_id}' is already running"}
+
+        try:
+            converter = self.__build_sse_converter(params.get("converter"))
+        except Exception as e:
+            self._log.error("Failed to build converter for SSE stream '%s': %s", stream_id, e)
+            return {"success": False, "error": f"Failed to build converter for SSE stream: {e}"}
+
+        stream_config = {
+            "url": url,
+            "httpMethod": params.get("httpMethod", "GET"),
+            "httpHeaders": params.get("httpHeaders", {"Accept": "text/event-stream"}),
+            "allowRedirects": params.get("allowRedirects", True),
+            "reconnectPeriod": params.get("reconnectPeriod", 5),
+            "dataUnpackExpression": params.get("dataUnpackExpression"),
+        }
+        if params.get("timeout") is not None:
+            stream_config["timeout"] = params["timeout"]
+
+        stop_event = Event()
+        request_dict = {
+            "config": stream_config,
+            "request": request,
+            "converter": converter,
+            "stop_event": stop_event,
+        }
+        thread = Thread(
+            target=self.__run_rpc_sse_stream,
+            args=(stream_id, request_dict, self._log),
+            daemon=True,
+            name="RPC SSE stream '%s' Thread" % stream_id,
+        )
+        self.__active_sse_streams[stream_id] = {"thread": thread, "stop_event": stop_event}
+        thread.start()
+        self._log.info("Started RPC-triggered SSE stream '%s' to %s", stream_id, url)
+        return {"success": True, "result": {"streamId": stream_id}}
+
+    def __stop_sse_stream_rpc(self, params: dict) -> dict:
+        params = params or {}
+        stream_id = params.get("streamId")
+        if not stream_id:
+            return {"success": False, "error": "streamId parameter is required to stop an SSE stream"}
+
+        stream = self.__active_sse_streams.get(stream_id)
+        if stream is None:
+            return {"success": False, "error": f"No active SSE stream found with id '{stream_id}'"}
+
+        stream["stop_event"].set()
+        self._log.info("Stopping RPC-triggered SSE stream '%s'", stream_id)
+        return {"success": True, "result": {"streamId": stream_id}}
+
+    def __build_sse_converter(self, converter_config):
+        converter_config = converter_config or {
+            "type": "json",
+            "deviceNameJsonExpression": "SSE Device",
+            "deviceTypeJsonExpression": "SSE",
+            "attributes": [],
+            "telemetry": [
+                {"key": "event", "type": "string", "value": "${event}"},
+                {"key": "value", "type": "string", "value": "${value}"},
+            ],
+        }
+        endpoint = {"converter": converter_config}
+        if converter_config.get("type") == "custom":
+            module = TBModuleLoader.import_module(self._connector_type, converter_config["extension"])
+            if module is None:
+                raise ValueError("Cannot find extension module '%s'" % converter_config.get("extension"))
+            return module(endpoint, self._converter_log)
+        return JsonRequestUplinkConverter(endpoint, self._converter_log)
+
+    def __run_rpc_sse_stream(self, stream_id, request, logger):
+        try:
+            self.__stream_sse_request(request, logger)
+        finally:
+            self.__active_sse_streams.pop(stream_id, None)
+            logger.info("RPC-triggered SSE stream '%s' ended", stream_id)
 
     @staticmethod
     def __result_to_dict(result: RpcExecutionResult) -> dict:
@@ -474,10 +572,14 @@ class RequestConnector(Connector, Thread):
         except Exception as e:
             logger.exception(e)
 
+    def __stream_sse_stopped(self, request):
+        stop_event = request.get("stop_event")
+        return self.__stopped or (stop_event is not None and stop_event.is_set())
+
     def __stream_sse_request(self, request, logger):
         url = ""
 
-        while not self.__stopped:
+        while not self.__stream_sse_stopped(request):
             reconnect_period = request.get("sse_reconnect_period", request["config"].get("reconnectPeriod", 5))
             try:
                 if request.get("converter") is None and isinstance(request["config"].get("converter"), dict):
@@ -522,7 +624,7 @@ class RequestConnector(Connector, Thread):
             except Exception as e:
                 logger.exception(e)
 
-            if not self.__stopped:
+            if not self.__stream_sse_stopped(request):
                 sleep(reconnect_period)
 
     def __process_sse_response(self, response, url, request, logger):
@@ -531,7 +633,7 @@ class RequestConnector(Connector, Thread):
         data_lines = []
 
         for line in response.iter_lines(decode_unicode=True):
-            if self.__stopped:
+            if self.__stream_sse_stopped(request):
                 return False
 
             if isinstance(line, bytes):
